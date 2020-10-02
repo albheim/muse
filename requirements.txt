@@ -1,2 +1,7 @@
 muselsl
 pyqt5
+matplotlib
+seaborn
+pandas
+numpy
+scipy

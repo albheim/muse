@@ -6,13 +6,49 @@ from time import sleep
 from pylsl import StreamInlet, resolve_byprop
 import seaborn as sns
 from scipy.signal import spectrogram
+import sys
+import pandas as pd
+import time
+from threading import Thread
 
 VIEW_BUFFER = 12
 VIEW_SUBSAMPLE = 2
 LSL_SCAN_TIMEOUT = 5
 LSL_EEG_CHUNK = 12
 
+class FileInlet:
+    def __init__(self, fname):
+        self.data = pd.read_csv(fname)
+        self.last_time = self.data["timestamps"][0]
+        self.delta_time = time.time() - self.last_time
 
+    def sfreq(self):
+        return 250#1 / (self.data.loc[1, "timestamps"] - self.data.loc[0, "timestamps"])
+
+    def ch_names(self):
+        return self.data.columns[1:]
+    
+    def pull_chunk(self, timeout, max_samples):
+        start = time.time()
+        t = start - self.delta_time
+        # pull all idxs which are between last_time and t
+        idxs = (self.last_time < self.data["timestamps"]) & (self.data["timestamps"] <= t)
+        while not any(idxs):
+            if time.time() - start > timeout:
+                return None, None
+            #sleep one period and we will have one event, should use timeout but...
+            time.sleep(1 / self.sfreq())
+            t = time.time() - self.delta_time
+            idxs = (self.last_time < self.data["timestamps"]) & (self.data["timestamps"] <= t)
+        if np.sum(idxs) > max_samples:
+            # take only last max_samples of them
+            pass
+        self.last_time = t
+        times = self.data.loc[idxs, "timestamps"].to_numpy()
+        samples = self.data.loc[idxs, self.data.columns != "timestamps"].to_numpy()
+        print(times, times.shape)
+        print(samples, samples.shape)
+        return samples, times
 
 class LSLViewer():
     def __init__(self, stream, fig, axes, window, scale, dejitter=True):
@@ -21,25 +57,33 @@ class LSLViewer():
         self.window = window
         self.scale = scale
         self.dejitter = dejitter
-        self.inlet = StreamInlet(stream, max_chunklen=LSL_EEG_CHUNK)
         self.filt = True
         self.subsample = VIEW_SUBSAMPLE
 
-        info = self.inlet.info()
-        description = info.desc()
+        if isinstance(stream, str):
+            self.inlet = FileInlet(stream)
+            self.sfreq = self.inlet.sfreq()
+            self.ch_names = self.inlet.ch_names()
+            self.n_chan = len(self.ch_names)
+        else:
+            self.inlet = StreamInlet(stream, max_chunklen=LSL_EEG_CHUNK)
 
-        self.sfreq = info.nominal_srate()
+            info = self.inlet.info()
+            description = info.desc()
+
+            self.sfreq = info.nominal_srate()
+            self.n_chan = info.channel_count()
+
+            ch = description.child('channels').first_child()
+            ch_names = [ch.child_value('label')]
+
+            for i in range(self.n_chan):
+                ch = ch.next_sibling()
+                ch_names.append(ch.child_value('label'))
+
+            self.ch_names = ch_names
+
         self.n_samples = int(self.sfreq * self.window)
-        self.n_chan = info.channel_count()
-
-        ch = description.child('channels').first_child()
-        ch_names = [ch.child_value('label')]
-
-        for i in range(self.n_chan):
-            ch = ch.next_sibling()
-            ch_names.append(ch.child_value('label'))
-
-        self.ch_names = ch_names
 
         fig.canvas.mpl_connect('key_press_event', self.OnKeypress)
         fig.canvas.mpl_connect('button_press_event', self.onclick)
@@ -51,18 +95,29 @@ class LSLViewer():
 
         self.data = np.zeros((self.n_samples, self.n_chan))
         self.times = np.arange(-self.window, 0, 1. / self.sfreq)
-        impedances = np.std(self.data, axis=0)
 
-        f, t, S = self.getspec(self.data[:, 0])
-        self.im = self.axes.imshow(S, cmap=matplotlib.pyplot.cm.Reds, vmin=0, vmax=1,
-                                   extent=[t[0], t[-1], f[0], f[-1]])
+        impedances = np.std(self.data, axis=0)
+        lines = []
+
+        for ii in range(self.n_chan):
+            line, = axes.plot(self.times[::self.subsample],
+                              self.data[::self.subsample, ii] - ii, lw=1)
+            lines.append(line)
+        self.lines = lines
+
+        axes.set_ylim(-self.n_chan + 0.5, 0.5)
+        ticks = np.arange(0, -self.n_chan, -1)
 
         axes.set_xlabel('Time (s)')
         axes.xaxis.grid(False)
+        axes.set_yticks(ticks)
 
-        axes.set_ylabel('Frequency (Hz)')
+        ticks_labels = ['%s - %.1f' % (self.ch_names[ii], impedances[ii])
+                        for ii in range(self.n_chan)]
+        axes.set_yticklabels(ticks_labels)
 
         self.display_every = int(0.2 / (12 / self.sfreq))
+
         self.bf = firwin(32, np.array([1, 40]) / (self.sfreq / 2.), width=0.05,
                          pass_zero=False)
         self.af = [1.0]
@@ -71,42 +126,56 @@ class LSLViewer():
         self.filt_state = np.tile(zi, (self.n_chan, 1)).transpose()
         self.data_f = np.zeros((self.n_samples, self.n_chan))
 
-    def update_plot(self, k):
+    def update_plot(self):
+        k = 0
         try:
-            samples, timestamps = self.inlet.pull_chunk(timeout=1.0,
-                                                        max_samples=LSL_EEG_CHUNK)
-            if timestamps:
-                if self.dejitter:
-                    timestamps = np.float64(np.arange(len(timestamps)))
-                    timestamps /= self.sfreq
-                    timestamps += self.times[-1] + 1. / self.sfreq
-                self.times = np.concatenate([self.times, timestamps])
-                self.n_samples = int(self.sfreq * self.window)
-                self.times = self.times[-self.n_samples:]
-                self.data = np.vstack([self.data, samples])
-                self.data = self.data[-self.n_samples:]
-                filt_samples, self.filt_state = lfilter(
-                    self.bf, self.af,
-                    samples,
-                    axis=0, zi=self.filt_state)
-                self.data_f = np.vstack([self.data_f, filt_samples])
-                self.data_f = self.data_f[-self.n_samples:]
-                k += 1
-                if k % self.display_every == 0:
-                    if self.filt:
-                        plot_data = self.data_f
-                    elif not self.filt:
-                        plot_data = self.data - self.data.mean(axis=0)
+            while self.started:
+                samples, timestamps = self.inlet.pull_chunk(timeout=1.0,
+                                                            max_samples=LSL_EEG_CHUNK)
 
-                    _, _, S = self.getspec(plot_data[:, 0])
-                    self.im.set_data(S)
-            else:
-                sleep(0.2)
+                if timestamps is not None and len(timestamps) > 0:
+                    print(timestamps.shape)
+                    if self.dejitter:
+                        timestamps = np.arange(len(timestamps), dtype=np.float64)
+                        timestamps /= self.sfreq
+                        timestamps += self.times[-1] + 1. / self.sfreq
+                    print(self.times.shape, timestamps.shape)
+                    self.times = np.concatenate([self.times, timestamps])
+                    self.n_samples = int(self.sfreq * self.window)
+                    self.times = self.times[-self.n_samples:]
+                    self.data = np.vstack([self.data, samples])
+                    self.data = self.data[-self.n_samples:]
+                    filt_samples, self.filt_state = lfilter(
+                        self.bf, self.af,
+                        samples,
+                        axis=0, zi=self.filt_state)
+                    self.data_f = np.vstack([self.data_f, filt_samples])
+                    self.data_f = self.data_f[-self.n_samples:]
+                    k += 1
+                    if k == self.display_every:
+
+                        if self.filt:
+                            plot_data = self.data_f
+                        elif not self.filt:
+                            plot_data = self.data - self.data.mean(axis=0)
+                        for ii in range(self.n_chan):
+                            self.lines[ii].set_xdata(self.times[::self.subsample] -
+                                                     self.times[-1])
+                            self.lines[ii].set_ydata(plot_data[::self.subsample, ii] /
+                                                     self.scale - ii)
+                            impedances = np.std(plot_data, axis=0)
+
+                        ticks_labels = ['%s - %.2f' % (self.ch_names[ii],
+                                                       impedances[ii])
+                                        for ii in range(self.n_chan)]
+                        self.axes.set_yticklabels(ticks_labels)
+                        self.axes.set_xlim(-self.window, 0)
+                        self.fig.canvas.draw()
+                        k = 0
+                else:
+                    sleep(0.2)
         except RuntimeError as e:
             raise
-
-    def getspec(self, data):
-        return spectrogram(data, fs=1/256.0, nperseg=64, noverlap=48)
 
     def onclick(self, event):
         print((event.button, event.x, event.y, event.xdata, event.ydata))
@@ -124,23 +193,39 @@ class LSLViewer():
         elif event.key == 'd':
             self.filt = not(self.filt)
 
+    def start(self):
+        self.started = True
+        self.thread = Thread(target=self.update_plot)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def stop(self, close_event):
+        self.started = False
+
+
 
 def view(window, scale, refresh, figure, backend, version=1):
     matplotlib.use(backend)
     sns.set(style="whitegrid")
 
     figsize = np.int16(figure.split('x'))
-
-    print("Looking for an EEG stream...")
-    streams = resolve_byprop('type', 'EEG', timeout=LSL_SCAN_TIMEOUT)
-
-    if len(streams) == 0:
-        raise(RuntimeError("Can't find EEG stream."))
-    print("Start acquiring data.")
-
     fig, axes = matplotlib.pyplot.subplots(1, 1, figsize=figsize, sharex=True)
+
+    # Process input, if file sent in ...
+    if len(sys.argv) > 1:
+        fname = sys.argv[1]
+        streams = [fname]
+        # create fake datastream from file in sys.argv[1]
+    else:
+        print("Looking for an EEG stream...")
+        streams = resolve_byprop('type', 'EEG', timeout=LSL_SCAN_TIMEOUT)
+
+        if len(streams) == 0:
+            raise(RuntimeError("Can't find EEG stream."))
+        print("Start acquiring data.")
+
     lslv = LSLViewer(streams[0], fig, axes, window, scale)
-    #fig.canvas.mpl_connect('close_event', lslv.stop)
+    fig.canvas.mpl_connect('close_event', lslv.stop)
 
     help_str = """
                 toggle filter : d
@@ -151,7 +236,8 @@ def view(window, scale, refresh, figure, backend, version=1):
                 decrease time scale : +
                """
     print(help_str)
-    anim = animation.FuncAnimation(fig, lslv.update_plot, interval=50)
+    #anim = animation.FuncAnimation(fig, lslv.update_plot, interval=50)
+    lslv.start()
     matplotlib.pyplot.show()
 
 if __name__ == "__main__":
