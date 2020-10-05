@@ -1,6 +1,5 @@
 import numpy as np
 import matplotlib
-from matplotlib import animation
 from scipy.signal import lfilter, lfilter_zi, firwin
 from time import sleep
 from pylsl import StreamInlet, resolve_byprop
@@ -46,12 +45,10 @@ class FileInlet:
         self.last_time = t
         times = self.data.loc[idxs, "timestamps"].to_numpy()
         samples = self.data.loc[idxs, self.data.columns != "timestamps"].to_numpy()
-        print(times, times.shape)
-        print(samples, samples.shape)
         return samples, times
 
 class LSLViewer():
-    def __init__(self, stream, fig, axes, window, scale, dejitter=True):
+    def __init__(self, stream, fig, tsax, axes, window, scale, dejitter=True):
         """Init"""
         self.stream = stream
         self.window = window
@@ -89,6 +86,7 @@ class LSLViewer():
         fig.canvas.mpl_connect('button_press_event', self.onclick)
 
         self.fig = fig
+        self.tsaxes = tsax
         self.axes = axes
 
         sns.despine(left=True)
@@ -100,21 +98,32 @@ class LSLViewer():
         lines = []
 
         for ii in range(self.n_chan):
-            line, = axes.plot(self.times[::self.subsample],
-                              self.data[::self.subsample, ii] - ii, lw=1)
+            line, = self.tsaxes.plot(self.times[::self.subsample],
+                self.data[::self.subsample, ii] - ii, lw=1)
             lines.append(line)
         self.lines = lines
 
-        axes.set_ylim(-self.n_chan + 0.5, 0.5)
+        self.tsaxes.set_ylim(-self.n_chan + 0.5, 0.5)
         ticks = np.arange(0, -self.n_chan, -1)
 
-        axes.set_xlabel('Time (s)')
-        axes.xaxis.grid(False)
-        axes.set_yticks(ticks)
+        self.tsaxes.set_xlabel('Time (s)')
+        self.tsaxes.xaxis.grid(False)
+        self.tsaxes.set_yticks(ticks)
 
         ticks_labels = ['%s - %.1f' % (self.ch_names[ii], impedances[ii])
                         for ii in range(self.n_chan)]
-        axes.set_yticklabels(ticks_labels)
+        self.tsaxes.set_yticklabels(ticks_labels)
+
+        f, t, S = spectrogram(self.data[-self.sfreq:, 0], fs=self.sfreq, nperseg=64, noverlap=48)
+        self.im = []
+        for i in range(4):
+            self.im.append(self.axes[i].pcolormesh(t, f, np.random.rand(*S.shape), shading='gouraud'))
+            self.axes[i].set_xlabel("Time [sec]")
+        self.axes[0].set_ylabel('Frequency [Hz]')
+
+        #self.im = [self.specaxes[i].imshow(S, cmap=matplotlib.pyplot.cm.Reds) for i in range(4)]
+        #, vmin=0, vmax=1, extent=[t[0], t[-1], f[0], f[-1]])
+        print(self.im[0].get_array().shape)
 
         self.display_every = int(0.2 / (12 / self.sfreq))
 
@@ -134,12 +143,10 @@ class LSLViewer():
                                                             max_samples=LSL_EEG_CHUNK)
 
                 if timestamps is not None and len(timestamps) > 0:
-                    print(timestamps.shape)
                     if self.dejitter:
                         timestamps = np.arange(len(timestamps), dtype=np.float64)
                         timestamps /= self.sfreq
                         timestamps += self.times[-1] + 1. / self.sfreq
-                    print(self.times.shape, timestamps.shape)
                     self.times = np.concatenate([self.times, timestamps])
                     self.n_samples = int(self.sfreq * self.window)
                     self.times = self.times[-self.n_samples:]
@@ -153,7 +160,6 @@ class LSLViewer():
                     self.data_f = self.data_f[-self.n_samples:]
                     k += 1
                     if k == self.display_every:
-
                         if self.filt:
                             plot_data = self.data_f
                         elif not self.filt:
@@ -168,8 +174,13 @@ class LSLViewer():
                         ticks_labels = ['%s - %.2f' % (self.ch_names[ii],
                                                        impedances[ii])
                                         for ii in range(self.n_chan)]
-                        self.axes.set_yticklabels(ticks_labels)
-                        self.axes.set_xlim(-self.window, 0)
+                        self.tsaxes.set_yticklabels(ticks_labels)
+                        self.tsaxes.set_xlim(-self.window, 0)
+
+                        for i in range(4):
+                            _, _, S = spectrogram(plot_data[-self.sfreq:, i], fs=1/self.sfreq, nperseg=64, noverlap=48)
+                            self.im[i].set_array(np.random.rand(*S.shape))
+
                         self.fig.canvas.draw()
                         k = 0
                 else:
@@ -204,12 +215,18 @@ class LSLViewer():
 
 
 
-def view(window, scale, refresh, figure, backend, version=1):
-    matplotlib.use(backend)
+def view(window, scale, refresh, version=1):
+    matplotlib.use("Qt5Agg")
     sns.set(style="whitegrid")
 
-    figsize = np.int16(figure.split('x'))
-    fig, axes = matplotlib.pyplot.subplots(1, 1, figsize=figsize, sharex=True)
+    fig = matplotlib.pyplot.figure(figsize=(15, 12), constrained_layout=True)
+    gs = fig.add_gridspec(2, 4)
+    tsax = fig.add_subplot(gs[0, :])
+    ax1 = fig.add_subplot(gs[1, 0])
+    ax2 = fig.add_subplot(gs[1, 1])
+    ax3 = fig.add_subplot(gs[1, 2])
+    ax4 = fig.add_subplot(gs[1, 3])
+    axs = [ax1, ax2, ax3, ax4]
 
     # Process input, if file sent in ...
     if len(sys.argv) > 1:
@@ -224,7 +241,7 @@ def view(window, scale, refresh, figure, backend, version=1):
             raise(RuntimeError("Can't find EEG stream."))
         print("Start acquiring data.")
 
-    lslv = LSLViewer(streams[0], fig, axes, window, scale)
+    lslv = LSLViewer(streams[0], fig, tsax, axs, window, scale)
     fig.canvas.mpl_connect('close_event', lslv.stop)
 
     help_str = """
@@ -236,9 +253,8 @@ def view(window, scale, refresh, figure, backend, version=1):
                 decrease time scale : +
                """
     print(help_str)
-    #anim = animation.FuncAnimation(fig, lslv.update_plot, interval=50)
     lslv.start()
     matplotlib.pyplot.show()
 
 if __name__ == "__main__":
-    view(5, 100, 0.2, "15x6", "Qt5Agg")
+    view(5, 100, 0.2)
