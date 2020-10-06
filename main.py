@@ -22,7 +22,7 @@ class FileInlet:
         self.delta_time = time.time() - self.last_time
 
     def sfreq(self):
-        return 250#1 / (self.data.loc[1, "timestamps"] - self.data.loc[0, "timestamps"])
+        return int(1024 / (self.data.loc[1024, "timestamps"] - self.data.loc[0, "timestamps"]))
 
     def ch_names(self):
         return self.data.columns[1:]
@@ -79,6 +79,10 @@ class LSLViewer():
                 ch_names.append(ch.child_value('label'))
 
             self.ch_names = ch_names
+        
+        # This is to not show last channel (if removed we also need to add one more plot for spectrogram)
+        self.n_chan -= 1
+        self.ch_names = self.ch_names[0:-1]
 
         self.n_samples = int(self.sfreq * self.window)
 
@@ -114,10 +118,11 @@ class LSLViewer():
                         for ii in range(self.n_chan)]
         self.tsaxes.set_yticklabels(ticks_labels)
 
-        f, t, S = spectrogram(self.data[-self.sfreq:, 0], fs=self.sfreq, nperseg=64, noverlap=48)
         self.im = []
-        for i in range(4):
-            self.im.append(self.axes[i].pcolormesh(t, f, np.random.rand(*S.shape), shading='gouraud'))
+        for i in range(self.n_chan):
+            f, t, S = spectrogram(self.data[-2*self.sfreq:, i], fs=self.sfreq, nperseg=64, noverlap=48)
+            self.im.append(self.axes[i].pcolormesh(t-2, f, S, shading='gouraud'))
+            self.axes[i].set_title(self.ch_names[i])
             self.axes[i].set_xlabel("Time [sec]")
         self.axes[0].set_ylabel('Frequency [Hz]')
 
@@ -147,6 +152,7 @@ class LSLViewer():
                         timestamps = np.arange(len(timestamps), dtype=np.float64)
                         timestamps /= self.sfreq
                         timestamps += self.times[-1] + 1. / self.sfreq
+                    samples = samples[:, 0:-1]
                     self.times = np.concatenate([self.times, timestamps])
                     self.n_samples = int(self.sfreq * self.window)
                     self.times = self.times[-self.n_samples:]
@@ -178,14 +184,16 @@ class LSLViewer():
                         self.tsaxes.set_xlim(-self.window, 0)
 
                         for i in range(4):
-                            _, _, S = spectrogram(plot_data[-self.sfreq:, i], fs=1/self.sfreq, nperseg=64, noverlap=48)
-                            self.im[i].set_array(np.random.rand(*S.shape))
+                            f, t, S = spectrogram(plot_data[-2*self.sfreq:, i], fs=1/self.sfreq, nperseg=64, noverlap=48)
+                            self.im[i].set_array(S)
+                            self.im[i].autoscale()
 
                         self.fig.canvas.draw()
                         k = 0
                 else:
                     sleep(0.2)
         except RuntimeError as e:
+            print(e)
             raise
 
     def onclick(self, event):
